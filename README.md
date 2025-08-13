@@ -14,6 +14,6 @@
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/your‑username/pdf-generator-app.git
+git clone (https://github.com/Integratz/MonteCarloJiraConnector)
 cd pdf-generator-app
 ```

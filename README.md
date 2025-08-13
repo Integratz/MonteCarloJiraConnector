@@ -14,6 +14,6 @@
 ### 1. Clone the repo
 
 ```bash
-git clone [https://github.com/Integratz/MonteCarloJiraConnector](https://github.com/Integratz/MonteCarloJiraConnector)
+git clone https://github.com/Integratz/MonteCarloJiraConnector
 cd MonteCarloJiraConnector
 ```

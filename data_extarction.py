@@ -4,7 +4,8 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 import boto3
 from botocore.exceptions import ClientError
-from jira import JIRA
+import requests
+from requests.auth import HTTPBasicAuth
 import os
 from dataclasses import dataclass, asdict
 from decimal import Decimal
@@ -34,23 +35,8 @@ class JiraToDynamoDB:
         self.jira_config = jira_config
         self.dynamodb_config = dynamodb_config
         
-        # Initialize Jira client
-        self.jira = JIRA(
-            server=jira_config.server,
-            basic_auth=(jira_config.username, jira_config.api_token)
-        )
-        
         # Initialize DynamoDB client
-        # Option 1: Use default credentials (recommended)
         self.dynamodb = boto3.resource('dynamodb', region_name=dynamodb_config.region)
-        
-        # Option 2: Use explicit credentials (not recommended for production)
-        # self.dynamodb = boto3.resource(
-        #     'dynamodb',
-        #     region_name=dynamodb_config.region,
-        #     aws_access_key_id='your_access_key_here',
-        #     aws_secret_access_key='your_secret_access_key_here'
-        # )
         
         # Table names
         self.tables = {
@@ -120,149 +106,180 @@ class JiraToDynamoDB:
                     logger.error(f"Error creating table {schema['TableName']}: {e}")
                     raise
 
+    def search_issues_new_endpoint(self, jql: str, start_at: int = 0, max_results: int = 50) -> Dict[str, Any]:
+        """Use the new JQL search endpoint with minimal payload"""
+        try:
+            # Minimal payload that works
+            payload = {
+                "jql": jql,
+                "maxResults": max_results,
+                "fields": [
+                    "summary",
+                    "description", 
+                    "status",
+                    "assignee",
+                    "reporter",
+                    "priority",
+                    "issuetype",
+                    "created",
+                    "updated",
+                    "resolution",
+                    "labels",
+                    "components"  # Story points field - adjust as needed
+                ]
+            }
+            
+            response = requests.post(
+                f"{self.jira_config.server}/rest/api/3/search/jql",
+                json=payload,
+                auth=HTTPBasicAuth(self.jira_config.username, self.jira_config.api_token),
+                headers={'Content-Type': 'application/json'}
+            )
+            
+            if response.status_code != 200:
+                logger.error(f"New JQL endpoint failed: {response.status_code} - {response.text}")
+                # Fallback to standard endpoint
+                return self.search_issues_fallback(jql, start_at, max_results)
+            
+            return response.json()
+            
+        except Exception as e:
+            logger.error(f"Error with new JQL endpoint: {e}")
+            # Fallback to standard endpoint
+            return self.search_issues_fallback(jql, start_at, max_results)
+
+    def search_issues_fallback(self, jql: str, start_at: int = 0, max_results: int = 50) -> Dict[str, Any]:
+        """Fallback to standard search endpoint"""
+        try:
+            response = requests.get(
+                f"{self.jira_config.server}/rest/api/3/search",
+                params={
+                    'jql': jql,
+                    'startAt': start_at,
+                    'maxResults': max_results,
+                    'fields': 'summary,description,status,assignee,reporter,priority,issuetype,created,updated,resolution,labels,components,customfield_10016'
+                },
+                auth=HTTPBasicAuth(self.jira_config.username, self.jira_config.api_token)
+            )
+            
+            response.raise_for_status()
+            return response.json()
+            
+        except Exception as e:
+            logger.error(f"Fallback endpoint also failed: {e}")
+            raise
+
     def extract_jira_issues(self, days_back: int = 30) -> List[Dict[str, Any]]:
-        """Extract raw issue data from Jira using modern search API"""
+        """Extract raw issue data from Jira using new search API"""
         logger.info(f"Extracting Jira issues for the last {days_back} days")
         
         # Calculate date range
         end_date = datetime.now()
         start_date = end_date - timedelta(days=days_back)
         
-        # JQL query to get issues - using modern API
+        # JQL query to get issues
         jql = f'project = "{self.jira_config.project_key}" AND updated >= "{start_date.strftime("%Y-%m-%d")}" ORDER BY created DESC'
         
         issues = []
         start_at = 0
-        max_results = 50  # Reduced for better performance
+        max_results = 50
         
         while True:
             try:
-                # Use the modern search_issues API with proper parameters
-                batch = self.jira.search_issues(
-                    jql_str=jql,
-                    startAt=start_at,
-                    maxResults=max_results,
-                    expand='changelog,names',
-                    fields='summary,description,status,assignee,reporter,priority,issuetype,created,updated,resolution,labels,components,customfield_10016'
-                )
+                # Use new JQL endpoint
+                result = self.search_issues_new_endpoint(jql, start_at, max_results)
                 
+                batch = result.get('issues', [])
                 if not batch:
                     break
                 
-                for issue in batch:
-                    # Safely extract issue data with better error handling
+                for issue_raw in batch:
+                    fields = issue_raw.get('fields', {})
+                    
+                    # Extract issue data safely
                     issue_data = {
-                        'issue_id': issue.key,
-                        'summary': getattr(issue.fields, 'summary', '') or '',
-                        'description': self._safe_get_description(issue.fields),
-                        'status': getattr(issue.fields.status, 'name', 'Unknown') if hasattr(issue.fields, 'status') else 'Unknown',
-                        'assignee': self._safe_get_user_name(getattr(issue.fields, 'assignee', None)),
-                        'reporter': self._safe_get_user_name(getattr(issue.fields, 'reporter', None)),
-                        'priority': getattr(issue.fields.priority, 'name', None) if hasattr(issue.fields, 'priority') and issue.fields.priority else None,
-                        'issue_type': getattr(issue.fields.issuetype, 'name', 'Unknown') if hasattr(issue.fields, 'issuetype') else 'Unknown',
-                        'created': getattr(issue.fields, 'created', None),
-                        'updated': getattr(issue.fields, 'updated', None),
-                        'resolution': getattr(issue.fields.resolution, 'name', None) if hasattr(issue.fields, 'resolution') and issue.fields.resolution else None,
-                        'story_points': self._safe_get_story_points(issue.fields),
-                        'labels': getattr(issue.fields, 'labels', []) or [],
-                        'components': self._safe_get_components(getattr(issue.fields, 'components', [])),
+                        'issue_id': issue_raw.get('key', ''),
+                        'summary': fields.get('summary', '') or '',
+                        'description': self._safe_get_description(fields.get('description')),
+                        'status': self._safe_get_nested_field(fields, 'status', 'name', 'Unknown'),
+                        'assignee': self._safe_get_user_name(fields.get('assignee')),
+                        'reporter': self._safe_get_user_name(fields.get('reporter')),
+                        'priority': self._safe_get_nested_field(fields, 'priority', 'name'),
+                        'issue_type': self._safe_get_nested_field(fields, 'issuetype', 'name', 'Unknown'),
+                        'created': fields.get('created'),
+                        'updated': fields.get('updated'),
+                        'resolution': self._safe_get_nested_field(fields, 'resolution', 'name'),
+                        'story_points': self._safe_get_story_points(fields),
+                        'labels': fields.get('labels', []) or [],
+                        'components': self._safe_get_components(fields.get('components', [])),
                         'extract_timestamp': datetime.now().isoformat()
                     }
                     issues.append(issue_data)
                 
                 start_at += max_results
-                if len(batch) < max_results:
+                total = result.get('total', 0)
+                
+                logger.info(f"Extracted {len(issues)}/{total} issues so far...")
+                
+                if len(batch) < max_results or start_at >= total:
                     break
                     
             except Exception as e:
                 logger.error(f"Error extracting issues: {e}")
                 break
         
-        logger.info(f"Extracted {len(issues)} issues")
+        logger.info(f"Extracted {len(issues)} total issues")
         return issues
-    
-    def _safe_get_description(self, fields):
-        """Safely extract description from issue fields"""
+
+    def get_issue_changelog(self, issue_key: str) -> Dict[str, Any]:
+        """Get issue changelog using REST API"""
         try:
-            desc = getattr(fields, 'description', None)
-            if desc is None:
-                return ''
-            # Handle different description formats
-            if hasattr(desc, 'content'):
-                # New Atlassian Document Format
-                return str(desc)
-            else:
-                # Plain text or old format
-                return str(desc) if desc else ''
-        except Exception:
-            return ''
-    
-    def _safe_get_user_name(self, user):
-        """Safely extract user display name"""
-        if user is None:
-            return None
-        try:
-            return getattr(user, 'displayName', None) or getattr(user, 'name', None)
-        except Exception:
-            return None
-    
-    def _safe_get_story_points(self, fields):
-        """Safely extract story points from various custom fields"""
-        # Common story points field IDs - adjust as needed for your Jira instance
-        story_point_fields = ['customfield_10016', 'customfield_10002', 'customfield_10004']
-        
-        for field_id in story_point_fields:
-            try:
-                value = getattr(fields, field_id, None)
-                if value is not None:
-                    return float(value) if isinstance(value, (int, float)) else None
-            except Exception:
-                continue
-        return None
-    
-    def _safe_get_components(self, components):
-        """Safely extract component names"""
-        try:
-            if not components:
-                return []
-            return [getattr(c, 'name', str(c)) for c in components]
-        except Exception:
-            return []
+            response = requests.get(
+                f"{self.jira_config.server}/rest/api/3/issue/{issue_key}",
+                params={
+                    'expand': 'changelog',
+                    'fields': 'key'
+                },
+                auth=HTTPBasicAuth(self.jira_config.username, self.jira_config.api_token)
+            )
+            
+            response.raise_for_status()
+            return response.json()
+            
+        except Exception as e:
+            logger.error(f"Error getting changelog for {issue_key}: {e}")
+            return {}
 
     def extract_jira_transitions(self, issues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Extract status change transitions from Jira issues using modern API"""
+        """Extract status change transitions from Jira issues using REST API"""
         logger.info("Extracting Jira transitions")
         
         transitions = []
         
-        for issue_data in issues:
+        for i, issue_data in enumerate(issues):
+            if i % 10 == 0:
+                logger.info(f"Processing transitions for issue {i+1}/{len(issues)}")
+                
             try:
-                # Use the modern API to get issue with changelog
-                issue = self.jira.issue(
-                    issue_data['issue_id'], 
-                    expand='changelog',
-                    fields='key'
-                )
+                issue_with_changelog = self.get_issue_changelog(issue_data['issue_id'])
+                changelog = issue_with_changelog.get('changelog', {})
+                histories = changelog.get('histories', [])
                 
-                # Check if changelog exists
-                if not hasattr(issue, 'changelog') or not issue.changelog:
-                    continue
-                
-                # Process changelog histories
-                for history in issue.changelog.histories:
-                    if not hasattr(history, 'items') or not history.items:
-                        continue
-                        
-                    for item in history.items:
+                for history in histories:
+                    items = history.get('items', [])
+                    
+                    for item in items:
                         # Only process status changes
-                        if getattr(item, 'field', None) == 'status':
+                        if item.get('field') == 'status':
+                            author = history.get('author', {})
+                            
                             transition_data = {
-                                'issue_id': issue.key,
-                                'transition_timestamp': getattr(history, 'created', datetime.now().isoformat()),
-                                'from_status': getattr(item, 'fromString', None) or 'Unknown',
-                                'to_status': getattr(item, 'toString', None) or 'Unknown',
-                                'author': self._safe_get_user_name(getattr(history, 'author', None)) or 'Unknown',
-                                'transition_date': (getattr(history, 'created', datetime.now().isoformat()))[:10],  # YYYY-MM-DD format
+                                'issue_id': issue_data['issue_id'],
+                                'transition_timestamp': history.get('created', datetime.now().isoformat()),
+                                'from_status': item.get('fromString', 'Unknown'),
+                                'to_status': item.get('toString', 'Unknown'),
+                                'author': author.get('displayName', 'Unknown'),
+                                'transition_date': (history.get('created', datetime.now().isoformat()))[:10],
                                 'extract_timestamp': datetime.now().isoformat()
                             }
                             transitions.append(transition_data)
@@ -273,6 +290,49 @@ class JiraToDynamoDB:
         
         logger.info(f"Extracted {len(transitions)} transitions")
         return transitions
+    
+    def _safe_get_description(self, description):
+        """Safely extract description"""
+        if description is None:
+            return ''
+        if isinstance(description, dict):
+            return str(description)
+        return str(description) if description else ''
+    
+    def _safe_get_user_name(self, user):
+        """Safely extract user display name"""
+        if user is None:
+            return None
+        return user.get('displayName') or user.get('name')
+    
+    def _safe_get_nested_field(self, fields, field_name, sub_field, default=None):
+        """Safely get nested field value"""
+        field = fields.get(field_name)
+        if field is None:
+            return default
+        return field.get(sub_field, default)
+    
+    def _safe_get_story_points(self, fields):
+        """Safely extract story points from various custom fields"""
+        story_point_fields = ['customfield_10016', 'customfield_10002', 'customfield_10004']
+        
+        for field_id in story_point_fields:
+            value = fields.get(field_id)
+            if value is not None:
+                try:
+                    return float(value) if isinstance(value, (int, float)) else None
+                except (ValueError, TypeError):
+                    continue
+        return None
+    
+    def _safe_get_components(self, components):
+        """Safely extract component names"""
+        try:
+            if not components:
+                return []
+            return [c.get('name', str(c)) for c in components if isinstance(c, dict)]
+        except Exception:
+            return []
 
     def calculate_flow_metrics(self, issues: List[Dict[str, Any]], transitions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Calculate team flow metrics"""
@@ -284,6 +344,9 @@ class JiraToDynamoDB:
         daily_data = {}
         
         for issue in issues:
+            if not issue.get('created'):
+                continue
+                
             created_date = issue['created'][:10]
             if created_date not in daily_data:
                 daily_data[created_date] = {
@@ -308,17 +371,20 @@ class JiraToDynamoDB:
         for transition in transitions:
             if transition['to_status'] in ['Done', 'Closed', 'Resolved']:
                 issue_id = transition['issue_id']
-                # Find when issue was started (moved to In Progress)
+                # Find when issue was started
                 start_transition = next(
                     (t for t in transitions 
                      if t['issue_id'] == issue_id and t['to_status'] in ['In Progress', 'In Development']),
                     None
                 )
                 if start_transition:
-                    start_date = datetime.fromisoformat(start_transition['transition_timestamp'].replace('Z', '+00:00'))
-                    end_date = datetime.fromisoformat(transition['transition_timestamp'].replace('Z', '+00:00'))
-                    cycle_time = (end_date - start_date).days
-                    cycle_times[issue_id] = cycle_time
+                    try:
+                        start_date = datetime.fromisoformat(start_transition['transition_timestamp'].replace('Z', '+00:00'))
+                        end_date = datetime.fromisoformat(transition['transition_timestamp'].replace('Z', '+00:00'))
+                        cycle_time = (end_date - start_date).days
+                        cycle_times[issue_id] = cycle_time
+                    except ValueError:
+                        continue
         
         # Create metrics records
         for date, data in daily_data.items():
@@ -368,7 +434,7 @@ class JiraToDynamoDB:
                 'forecast_date': forecast_date.strftime('%Y-%m-%d'),
                 'predicted_throughput': Decimal(str(round(avg_throughput, 2))),
                 'predicted_cycle_time': Decimal(str(round(avg_cycle_time, 2))),
-                'confidence_level': Decimal('0.70'),  # 70% confidence
+                'confidence_level': Decimal('0.70'),
                 'forecast_type': 'throughput_based',
                 'created_at': datetime.now().isoformat()
             }
@@ -390,7 +456,7 @@ class JiraToDynamoDB:
                 try:
                     # Convert any float values to Decimal for DynamoDB
                     item_converted = self.convert_floats_to_decimal(item)
-                    batch.put_item(Item=item_converted)
+                    batch.put_item(Item=item_converted) 
                 except Exception as e:
                     logger.error(f"Error saving item to {table_name}: {e}")
         
@@ -407,7 +473,7 @@ class JiraToDynamoDB:
         else:
             return obj
 
-    def run_extraction(self, days_back: int = 10000):
+    def run_extraction(self, days_back: int = 200):
         """Run the complete extraction process"""
         logger.info("Starting Jira to DynamoDB extraction")
         
@@ -417,6 +483,10 @@ class JiraToDynamoDB:
             
             # Extract raw issues
             issues = self.extract_jira_issues(days_back)
+            if not issues:
+                logger.warning("No issues found. Check your project key and permissions.")
+                return
+                
             self.save_to_dynamodb(self.tables['issues'], issues)
             
             # Extract transitions
@@ -436,22 +506,22 @@ class JiraToDynamoDB:
         except Exception as e:
             logger.error(f"Error during extraction: {e}")
             raise
+
 def main():
     jira_config = JiraConfig(
-            server=os.getenv('JIRA_SERVER', 'https://integratz.atlassian.net'),
-            username=os.getenv('JIRA_USERNAME', 'noor@integratz.com'),
-            api_token=os.getenv('JIRA_API_TOKEN2', 'API_KEY'),
-            project_key=os.getenv('JIRA_PROJECT_KEY', 'TEST')
-        )
+        server = os.getenv('JIRA_SERVER'),
+        username = os.getenv('JIRA_USERNAME'),
+        api_token = os.getenv('JIRA_API_TOKEN'),
+        project_key = os.getenv('JIRA_PROJECT_KEY')
+    )
 
     dynamodb_config = DynamoDBConfig(
         region=os.getenv('AWS_REGION', 'us-east-1'),
         table_prefix=os.getenv('DYNAMODB_TABLE_PREFIX', 'jira')
-        )
+    )
 
     extractor = JiraToDynamoDB(jira_config, dynamodb_config)
-
-    extractor.run_extraction(days_back=30)
+    extractor.run_extraction(days_back=356)
 
 if __name__ == "__main__":
-        main()
+    main()

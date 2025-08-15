@@ -1,4 +1,4 @@
-# test_new_jql_endpoint.py
+# test_new_jql_endpoint_fixed.py
 import os
 from dotenv import load_dotenv
 import requests
@@ -10,7 +10,7 @@ load_dotenv()
 def test_new_jql_endpoint():
     server = os.getenv('JIRA_SERVER')
     username = os.getenv('JIRA_USERNAME')
-    api_token = os.getenv('JIRA_API_TOKEN_noor')
+    api_token = os.getenv('JIRA_API_TOKEN')
     project_key = os.getenv('JIRA_PROJECT_KEY')
     
     print(f"Testing NEW JQL endpoint: {server}/rest/api/3/search/jql")
@@ -31,28 +31,25 @@ def test_new_jql_endpoint():
         print(f"❌ Server connection failed: {e}")
         return False
     
-    # Test NEW JQL search endpoint
+    # Test NEW JQL search endpoint with corrected payload
     try:
-        jql = f'project = "{project_key}"'
+        jql = f'project = "{project_key}" ORDER BY created DESC'
         
-        # Request body
-        payload =  {
-            "expand": "",
-            "jql": "project = TEST",
+        # Corrected request body - removed problematic fields
+        payload = {
+            "jql": jql,
             "startAt": 0,
             "maxResults": 10,
-            "fieldsByKeys": True,
-            "nextPageToken": "",
-            "properties": [
-                
-            ],
             "fields": [
                 "summary",
-                "status",
-                "assignee"
-            ],
-            "reconcileIssues": True
-            }
+                "status", 
+                "assignee",
+                "created"
+            ]
+        }
+        
+        print(f"JQL Query: {jql}")
+        print(f"Payload: {json.dumps(payload, indent=2)}")
         
         response = requests.post(
             f"{server}/rest/api/3/search/jql",
@@ -63,6 +60,10 @@ def test_new_jql_endpoint():
         
         print(f"Request URL: {response.url}")
         print(f"Response Status: {response.status_code}")
+        
+        if response.status_code != 200:
+            print(f"Response Headers: {dict(response.headers)}")
+            print(f"Response Body: {response.text}")
         
         response.raise_for_status()
         result = response.json()
@@ -88,6 +89,11 @@ def test_new_jql_endpoint():
         print(f"   Status Code: {e.response.status_code}")
         print(f"   Response: {e.response.text}")
         
+        # If still getting 400, try even simpler payload
+        if e.response.status_code == 400:
+            print("\n🔄 Trying minimal payload...")
+            return test_minimal_payload(server, username, api_token, project_key)
+        
         # If the new endpoint doesn't work, suggest fallback
         if e.response.status_code == 404:
             print("\n💡 The new /rest/api/3/search/jql endpoint might not be available yet.")
@@ -99,6 +105,41 @@ def test_new_jql_endpoint():
         
     except Exception as e:
         print(f"❌ NEW JQL search API failed: {e}")
+        return False
+
+def test_minimal_payload(server, username, api_token, project_key):
+    """Test with absolute minimal payload"""
+    try:
+        jql = f'project = "{project_key}"'
+        
+        # Minimal payload
+        payload = {
+            "jql": jql
+        }
+        
+        print(f"Trying minimal payload: {json.dumps(payload, indent=2)}")
+        
+        response = requests.post(
+            f"{server}/rest/api/3/search/jql",
+            json=payload,
+            auth=HTTPBasicAuth(username, api_token),
+            headers={'Content-Type': 'application/json'}
+        )
+        
+        print(f"Minimal payload response status: {response.status_code}")
+        
+        if response.status_code != 200:
+            print(f"Response: {response.text}")
+            return False
+            
+        result = response.json()
+        issues = result.get('issues', [])
+        
+        print(f"✅ Minimal payload works! Found {len(issues)} issues")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Minimal payload also failed: {e}")
         return False
 
 def test_fallback_endpoint(server, username, api_token, project_key):
@@ -126,8 +167,8 @@ def test_fallback_endpoint(server, username, api_token, project_key):
             print(f"   📋 {issue.get('key')}: {fields.get('summary', 'No summary')}")
         
         print("\n⚠️  RECOMMENDATION:")
-        print("   The new JQL endpoint isn't available, but the standard search works.")
-        print("   You can use the current code, but monitor for when the new endpoint becomes available.")
+        print("   The new JQL endpoint isn't working properly, but the standard search works.")
+        print("   Stick with the current /rest/api/3/search endpoint for now.")
         
         return True
         
@@ -135,11 +176,40 @@ def test_fallback_endpoint(server, username, api_token, project_key):
         print(f"❌ Fallback endpoint also failed: {e}")
         return False
 
+def test_endpoint_availability():
+    """Check if the new endpoint exists by testing with OPTIONS"""
+    server = os.getenv('JIRA_SERVER')
+    username = os.getenv('JIRA_USERNAME')
+    api_token = os.getenv('JIRA_API_TOKEN_noor')
+    
+    try:
+        response = requests.options(
+            f"{server}/rest/api/3/search/jql",
+            auth=HTTPBasicAuth(username, api_token)
+        )
+        
+        print(f"OPTIONS response status: {response.status_code}")
+        print(f"Allowed methods: {response.headers.get('Allow', 'Not specified')}")
+        
+        if response.status_code == 404:
+            print("❌ Endpoint not found - not available in this Jira version")
+            return False
+        elif response.status_code in [200, 204]:
+            print("✅ Endpoint exists")
+            return True
+        else:
+            print(f"❓ Unclear endpoint status: {response.status_code}")
+            return None
+            
+    except Exception as e:
+        print(f"❌ Could not test endpoint availability: {e}")
+        return None
+
 def check_jira_version_compatibility():
     """Check if Jira version supports the new endpoint"""
     server = os.getenv('JIRA_SERVER')
     username = os.getenv('JIRA_USERNAME')
-    api_token = os.getenv('JIRA_API_TOKEN')
+    api_token = os.getenv('JIRA_API_TOKEN_noor')
     
     try:
         response = requests.get(
@@ -173,15 +243,28 @@ def check_jira_version_compatibility():
         print(f"❌ Could not get server info: {e}")
 
 if __name__ == "__main__":
-    print("=== Testing New Jira JQL Search Endpoint ===\n")
+    print("=== Testing New Jira JQL Search Endpoint (Fixed) ===\n")
     
     # Check Jira version first
     check_jira_version_compatibility()
     
-    # Test the new endpoint
-    success = test_new_jql_endpoint()
+    # Check if endpoint exists
+    print("\n🔍 Checking endpoint availability...")
+    endpoint_available = test_endpoint_availability()
     
-    if success:
-        print("\n🎉 All tests passed! The new JQL endpoint is working correctly.")
+    if endpoint_available is False:
+        print("\n❌ New JQL endpoint not available. Using fallback.")
+        server = os.getenv('JIRA_SERVER')
+        username = os.getenv('JIRA_USERNAME')
+        api_token = os.getenv('JIRA_API_TOKEN_noor')
+        project_key = os.getenv('JIRA_PROJECT_KEY')
+        test_fallback_endpoint(server, username, api_token, project_key)
     else:
-        print("\n❌ Tests failed. Check your configuration or Jira version.")
+        # Test the new endpoint
+        success = test_new_jql_endpoint()
+        
+        if success:
+            print("\n🎉 All tests passed! The new JQL endpoint is working correctly.")
+        else:
+            print("\n❌ Tests failed. The new endpoint might not be fully supported yet.")
+            print("   Recommend using the standard /rest/api/3/search endpoint.")

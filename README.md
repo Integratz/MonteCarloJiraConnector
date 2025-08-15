@@ -16,4 +16,6 @@
 ```bash
 git clone [https://github.com/Integratz/MonteCarloJiraConnector](https://github.com/Integratz/MonteCarloJiraConnector)
 cd MonteCarloJiraConnector
+
+Project keys: TEST & IN
 ```
